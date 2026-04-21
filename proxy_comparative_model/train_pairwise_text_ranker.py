@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -494,7 +495,74 @@ def export_pairs_jsonl(
 
 
 # ------------------------------
-# Pragma-aware attention helpers
+# Pragma-aware tokenization
+# ------------------------------
+#
+# Register canonical HLS pragma directive heads as atomic special tokens so
+# each `#pragma HLS <DIRECTIVE>` becomes a single id instead of 4-6 BPE
+# sub-tokens. Texts are preprocessed with `pragma_normalize` before tokenizing
+# so the atomic-token matching is reliable across tokenizer implementations.
+
+PRAGMA_TOKEN_MAP: List[Tuple[str, str]] = [
+    ("#pragma HLS PIPELINE",             "<pragma_pipeline>"),
+    ("#pragma HLS UNROLL",               "<pragma_unroll>"),
+    ("#pragma HLS ARRAY_PARTITION",      "<pragma_array_partition>"),
+    ("#pragma HLS ARRAY_RESHAPE",        "<pragma_array_reshape>"),
+    ("#pragma HLS DATAFLOW",             "<pragma_dataflow>"),
+    ("#pragma HLS INLINE",               "<pragma_inline>"),
+    ("#pragma HLS INTERFACE",            "<pragma_interface>"),
+    ("#pragma HLS LATENCY",              "<pragma_latency>"),
+    ("#pragma HLS loop_tripcount",       "<pragma_loop_tripcount>"),
+    ("#pragma HLS ALLOCATION",           "<pragma_allocation>"),
+    ("#pragma HLS RESOURCE",             "<pragma_resource>"),
+    ("#pragma HLS BIND_OP",              "<pragma_bind_op>"),
+    ("#pragma HLS BIND_STORAGE",         "<pragma_bind_storage>"),
+    ("#pragma HLS STREAM",               "<pragma_stream>"),
+    ("#pragma HLS DEPENDENCE",           "<pragma_dependence>"),
+    ("#pragma HLS AGGREGATE",            "<pragma_aggregate>"),
+    ("#pragma HLS DISAGGREGATE",         "<pragma_disaggregate>"),
+    ("#pragma HLS FUNCTION_INSTANTIATE", "<pragma_function_instantiate>"),
+    ("#pragma HLS STABLE",               "<pragma_stable>"),
+    ("#pragma HLS OCCURRENCE",           "<pragma_occurrence>"),
+    ("#pragma HLS EXPRESSION_BALANCE",   "<pragma_expression_balance>"),
+    ("#pragma HLS TOP",                  "<pragma_top>"),
+    ("#pragma HLS PROTOCOL",             "<pragma_protocol>"),
+    ("#pragma HLS PERFORMANCE",          "<pragma_performance>"),
+    ("#pragma HLS RESET",                "<pragma_reset>"),
+    ("#pragma HLS REWIND",               "<pragma_rewind>"),
+]
+
+# Compile patterns once, sorted by source length (longest first) so that
+# "ARRAY_PARTITION" never matches inside a shorter directive.
+_PRAGMA_COMPILED: List[Tuple[re.Pattern, str]] = [
+    (re.compile(re.escape(src), flags=re.IGNORECASE), dst)
+    for src, dst in sorted(PRAGMA_TOKEN_MAP, key=lambda p: -len(p[0]))
+]
+
+
+def pragma_normalize(text: str) -> str:
+    """Replace canonical HLS pragma headers with atomic placeholder tokens."""
+    out = text
+    for pat, dst in _PRAGMA_COMPILED:
+        out = pat.sub(dst, out)
+    return out
+
+
+def add_pragma_special_tokens(tokenizer, model: Optional[nn.Module] = None) -> int:
+    """Register pragma placeholder tokens as atomic special tokens.
+
+    Returns the number of tokens newly added. If a model is provided and new
+    tokens were added, its input embedding matrix is resized accordingly.
+    """
+    new_tokens = [dst for _, dst in PRAGMA_TOKEN_MAP]
+    n_added = tokenizer.add_tokens(new_tokens, special_tokens=True)
+    if model is not None and n_added > 0:
+        model.resize_token_embeddings(len(tokenizer))
+    return n_added
+
+
+# ------------------------------
+# Pragma-aware attention helpers (legacy, kept for --pragma_attn_bias)
 # ------------------------------
 
 def find_pragma_spans(text: str) -> List[Tuple[int, int]]:
@@ -519,7 +587,10 @@ def tokenize_with_pragma(
     texts: List[str],
     max_length: int,
     with_pragma: bool,
+    pragma_tokenization: bool = False,
 ) -> Dict[str, torch.Tensor]:
+    if pragma_tokenization:
+        texts = [pragma_normalize(t) for t in texts]
     enc = tokenizer(
         texts,
         padding=True,
@@ -683,13 +754,19 @@ class UniXcoderPairRanker(nn.Module):
 # Train/eval helpers
 # ------------------------------
 
-def make_collate_fn(samples: List[DesignSample], tokenizer, max_length: int, with_pragma: bool = False):
+def make_collate_fn(
+    samples: List[DesignSample],
+    tokenizer,
+    max_length: int,
+    with_pragma: bool = False,
+    pragma_tokenization: bool = False,
+):
     def collate(batch: List[PairSample]):
         txt_i = [samples[x.i_idx].text for x in batch]
         txt_j = [samples[x.j_idx].text for x in batch]
 
-        tok_i = tokenize_with_pragma(tokenizer, txt_i, max_length, with_pragma)
-        tok_j = tokenize_with_pragma(tokenizer, txt_j, max_length, with_pragma)
+        tok_i = tokenize_with_pragma(tokenizer, txt_i, max_length, with_pragma, pragma_tokenization)
+        tok_j = tokenize_with_pragma(tokenizer, txt_j, max_length, with_pragma, pragma_tokenization)
 
         labels = torch.tensor([x.label for x in batch], dtype=torch.float32)
         names_i = [x.name_i for x in batch]
@@ -828,6 +905,7 @@ def best_anchor_pairwise_report(
     device: torch.device,
     max_length: int,
     max_apps: int = 20,
+    pragma_tokenization: bool = False,
 ):
     model.eval()
     app2idx: Dict[str, List[int]] = {}
@@ -862,12 +940,14 @@ def best_anchor_pairwise_report(
                 [samples[anchor_idx].text for _, anchor_idx in rows_meta],
                 max_length,
                 with_pragma,
+                pragma_tokenization,
             )
             tok_cand = tokenize_with_pragma(
                 tokenizer,
                 [samples[cand_idx].text for cand_idx, _ in rows_meta],
                 max_length,
                 with_pragma,
+                pragma_tokenization,
             )
             tok_anchor = move_batch(tok_anchor, device)
             tok_cand = move_batch(tok_cand, device)
@@ -1100,10 +1180,24 @@ def main(args):
             return
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    n_pragma_added = 0
+    if args.pragma_tokenization:
+        n_pragma_added = add_pragma_special_tokens(tokenizer, model=None)
+        print(
+            f"Pragma-aware tokenization ENABLED "
+            f"(added {n_pragma_added}/{len(PRAGMA_TOKEN_MAP)} atomic pragma tokens; "
+            f"vocab={len(tokenizer)})"
+        )
 
     train_ds = PairTextDataset(train_pairs)
     test_ds = PairTextDataset(test_pairs)
-    collate_fn = make_collate_fn(samples, tokenizer, args.max_length, with_pragma=args.pragma_attn_bias)
+    collate_fn = make_collate_fn(
+        samples,
+        tokenizer,
+        args.max_length,
+        with_pragma=args.pragma_attn_bias,
+        pragma_tokenization=args.pragma_tokenization,
+    )
 
     train_loader = DataLoader(
         train_ds,
@@ -1131,6 +1225,10 @@ def main(args):
         pragma_attn_bias_init=args.pragma_attn_bias_init,
         pragma_bias_per_layer=args.pragma_bias_per_layer,
     ).to(device)
+    if args.pragma_tokenization and n_pragma_added > 0:
+        model.encoder.resize_token_embeddings(len(tokenizer))
+        # Move the newly initialized embedding rows to the training device.
+        model.to(device)
     if args.pragma_attn_bias:
         print(
             f"Pragma-aware attention bias ENABLED "
@@ -1236,6 +1334,7 @@ def main(args):
         device,
         max_length=args.max_length,
         max_apps=args.report_max_apps,
+        pragma_tokenization=args.pragma_tokenization,
     )
 
 
@@ -1296,6 +1395,10 @@ def build_argparser():
     p.add_argument("--target_gap_loss_weight", type=float, default=0.1,
                    help="Compatibility-only argument; ignored in pure pairwise mode")
     p.add_argument("--pairwise_residual_alpha", type=float, default=0.0)
+    p.add_argument("--pragma_tokenization", action="store_true",
+                   help="Enable pragma-aware tokenization: register each #pragma HLS "
+                        "directive (PIPELINE/UNROLL/ARRAY_PARTITION/...) as an atomic "
+                        "special token and resize the model embedding matrix accordingly")
     p.add_argument("--pragma_attn_bias", action="store_true",
                    help="Enable learned additive attention bias on #pragma HLS tokens")
     p.add_argument("--pragma_attn_bias_init", type=float, default=1.0,
