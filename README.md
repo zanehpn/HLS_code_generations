@@ -6,7 +6,8 @@ Code, training recipes, and evaluation benchmarks for generating HLS (High-Level
 
 ![Training flow](fig/training_flow.png)
 
-See [`fig/training_flow.pdf`](fig/training_flow.pdf) (or [`fig/training_flow.png`](fig/training_flow.png)) for the full training pipeline diagram (SFT-1 → SFT-2 → GRPO with reasoning + uncertainty-aware proxy reward switching).
+See [`fig/training_flow.pdf`](fig/training_flow.pdf) (or [`fig/training_flow.png`](fig/training_flow.png)) for the full training pipeline diagram (Diversity-
+Oriented SFT → Cold-Start SFT → GRPO with reasoning + uncertainty-aware proxy reward switching).
 
 ## Directory Layout
 
@@ -94,7 +95,8 @@ A copy of the public [sharc-lab/hls-eval](https://github.com/sharc-lab/hls-eval)
 
 | File | Description |
 |---|---|
-| `training_flow.pdf` / `training_flow.png` | End-to-end training pipeline: SFT → DPO → GRPO (reasoning + uncertainty-gated reward). |
+| `training_flow.pdf` / `training_flow.png` | End-to-end training pipeline: Diversity-
+Oriented SFT → Cold-Start SFT → GRPO (reasoning + uncertainty-gated reward). |
 
 ## Setup
 
