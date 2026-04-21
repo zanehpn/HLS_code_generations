@@ -6,7 +6,7 @@ Code, training recipes, and evaluation benchmarks for generating HLS (High-Level
 
 ![Training flow](fig/training_flow.pdf)
 
-See [`fig/training_flow.pdf`](fig/training_flow.pdf) for the full training pipeline diagram (SFT → DPO → GRPO with reasoning + uncertainty-aware proxy reward switching).
+See [`fig/training_flow.pdf`](fig/training_flow.pdf) for the full training pipeline diagram (SFT-1 → SFT-2 → GRPO with reasoning + uncertainty-aware proxy reward switching).
 
 ## Directory Layout
 
