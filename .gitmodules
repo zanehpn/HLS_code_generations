@@ -1,0 +1,3 @@
+[submodule "hls-eval"]
+	path = hls-eval
+	url = https://github.com/sharc-lab/hls-eval.git
